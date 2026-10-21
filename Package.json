@@ -1,0 +1,14 @@
+{
+  "name": "breed-a-life",
+  "version": "2.0.0",
+  "description": "Breed a Life — a full-stack Christian blog with an admin dashboard. Zero dependencies: Node.js built-ins only.",
+  "main": "server.js",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server.js",
+    "reset-password": "node --disable-warning=ExperimentalWarning scripts/reset-password.js"
+  }
+}
