@@ -1,398 +1,290 @@
-/* Breed a Life: forms, reader accounts, devotion notes and journal. */
-(function () {
-  'use strict';
-  var $ = function (s, r) { return (r || document).querySelector(s); };
-  var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
-  var signedIn = document.body.getAttribute('data-reader') === '1';
+'use strict';
+// Optional reader accounts. Used ONLY for devotion notes and progress tracking.
+const database = require('../db');
+const { all, get, run, tx } = database;
+const auth = require('../auth');
+const readers = require('../readers');
+const resets = require('../resets');
+const mailer = require('../mailer');
+const settings = require('../settings');
+const { HttpError, json, readJson, send } = require('../http');
+const U = require('../util');
 
-  function api(method, url, body, opts) {
-    var init = {
-      method: method, credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'sx-reader', 'X-TZ-Offset': String(new Date().getTimezoneOffset()) }
-    };
-    if (body !== undefined) init.body = JSON.stringify(body);
-    if (opts && opts.keepalive) init.keepalive = true;
-    return fetch(url, init).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (d) {
-        if (!r.ok) { var e = new Error(d.error || 'Something went wrong. Please try again.'); e.status = r.status; throw e; }
-        return d;
-      });
-    });
-  }
-  function el(tag, attrs, kids) {
-    var n = document.createElement(tag);
-    Object.keys(attrs || {}).forEach(function (k) {
-      if (k === 'class') n.className = attrs[k];
-      else if (k === 'text') n.textContent = attrs[k];
-      else if (k.slice(0, 2) === 'on') n.addEventListener(k.slice(2), attrs[k]);
-      else if (attrs[k] !== false && attrs[k] != null) n.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
-    });
-    (kids || []).forEach(function (c) { if (c != null) n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
-    return n;
-  }
-  function safeNext(v) { return typeof v === 'string' && /^\/(?!\/)[^\\\s]*$/.test(v) ? v : ''; }
-  function setMsg(form, text, kind) {
-    var m = $('.form-msg', form);
-    if (!m) return;
-    m.textContent = text || '';
-    m.className = 'form-msg' + (kind ? ' is-' + kind : '');
-  }
-  function fmtDate(iso) {
-    try { return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }); } catch (e) { return ''; }
-  }
+const loginIp = auth.createLimiter(10, 15 * 60 * 1000);
+const loginEmail = auth.createLimiter(8, 15 * 60 * 1000);
+const joinIp = auth.createLimiter(6, 60 * 60 * 1000);
+const forgotIp = auth.createLimiter(6, 60 * 60 * 1000);
+const forgotEmail = auth.createLimiter(3, 60 * 60 * 1000);
+const resetIp = auth.createLimiter(10, 60 * 60 * 1000);
+const noteLimit = auth.createLimiter(240, 60 * 1000);
 
-  /* ---------------- account + contact forms ---------------- */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const MIN_PW = 8;
+const MAX_NOTE = 20000;
 
-  /* ---------- download & share notes (all client-side; sharing is always the reader's own action) ---------- */
-  var SITE = (document.querySelector('meta[property="og:site_name"]') || {}).content || 'Breed a Life';
-  function slugName(t) { return (String(t || 'notes').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'notes').slice(0, 60); }
-  function stamp() { return new Date().toISOString().slice(0, 10); }
-  function noteText(items, fmt) {
-    var md = fmt === 'md', out = [];
-    items.forEach(function (it) {
-      var url = it.slug ? location.origin + '/post/' + it.slug : '';
-      var head = it.title || 'Untitled devotion';
-      var sub = SITE + (it.date ? ' · ' + it.date : '');
-      out.push((md ? '## ' + head : head.toUpperCase() + '\n' + new Array(Math.min(head.length, 60) + 1).join('=')) + '\n' + (md ? '*' + sub + '*' : sub) + '\n\n' + (it.body || '(No notes written yet.)') + (url ? '\n\nRead the reflection: ' + url : ''));
-    });
-    var title = items.length === 1 ? '' : (md ? '# My devotion notes' : 'MY DEVOTION NOTES') + '\n' + SITE + ' · ' + stamp() + '\n\n';
-    return title + out.join(md ? '\n\n---\n\n' : '\n\n----------\n\n') + '\n';
-  }
-  function saveFile(name, mime, content) {
-    var a = document.createElement('a'), url = URL.createObjectURL(new Blob([content], { type: mime + ';charset=utf-8' }));
-    a.href = url; a.download = name; document.body.appendChild(a); a.click();
-    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1500);
-  }
-  function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
-  function printPdf(items) {
-    var f = document.createElement('iframe'); f.setAttribute('aria-hidden', 'true'); f.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
-    document.body.appendChild(f);
-    var d = f.contentWindow.document;
-    var body = items.map(function (it) {
-      return '<section><h2>' + esc(it.title || 'Untitled devotion') + '</h2><p class="m">' + esc(SITE + (it.date ? ' · ' + it.date : '')) + '</p><div class="n">' + esc(it.body || '(No notes written yet.)') + '</div>' + (it.slug ? '<p class="u">' + esc(location.origin + '/post/' + it.slug) + '</p>' : '') + '</section>';
-    }).join('');
-    d.open();
-    d.write('<!doctype html><html><head><meta charset="utf-8"><title>' + esc(items.length === 1 ? (items[0].title || 'Devotion notes') : 'My devotion notes') + '</title><style>body{font:12pt/1.6 Georgia,serif;color:#111;margin:0}h1{font-size:20pt;margin:0 0 4pt;color:#17297a}h2{font-size:15pt;margin:0 0 2pt;color:#17297a}.m,.u{color:#666;font-size:10pt;margin:0 0 8pt}.n{white-space:pre-wrap;margin:0 0 6pt}section{padding:0 0 14pt;margin:0 0 14pt;border-bottom:1px solid #ddd;break-inside:avoid-page}@page{margin:18mm}</style></head><body>' + (items.length > 1 ? '<h1>My devotion notes</h1><p class="m">' + esc(SITE) + ' · ' + stamp() + '</p>' : '') + body + '</body></html>');
-    d.close();
-    setTimeout(function () { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) {} setTimeout(function () { f.remove(); }, 2000); }, 250);
-  }
-  /** Build a "Download / Share" menu. getItems() returns [{title, slug, body, date}]. */
-  function shareMenu(getItems, opts) {
-    opts = opts || {};
-    var wrap = el('div', { class: 'share' });
-    var btn = el('button', { type: 'button', class: opts.btnClass || 'btn', 'aria-haspopup': 'true', 'aria-expanded': 'false', text: opts.label || 'Download or share' });
-    var pop = el('div', { class: 'share-pop', role: 'menu', hidden: '' });
-    var note = el('p', { class: 'share-note', role: 'status', 'aria-live': 'polite' });
-    function items() { return (getItems() || []).filter(function (x) { return x && (x.body || '').trim(); }); }
-    function close() { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
-    function say(t) { note.textContent = t; }
-    function item(label, fn, hint) {
-      var b = el('button', { type: 'button', role: 'menuitem', class: 'share-item' }, [el('span', { text: label }), hint ? el('small', { text: hint }) : null]);
-      b.addEventListener('click', function () {
-        var list = items();
-        if (!list.length) { say('Write a note first, then you can download or share it.'); return; }
-        fn(list);
-      });
-      pop.appendChild(b);
+function csrf(ctx) {
+  if (ctx.method !== 'GET' && ctx.method !== 'HEAD' && ctx.req.headers['x-requested-with'] !== 'sx-reader') throw new HttpError(403, 'Missing required request header.');
+}
+function guard(ctx) {
+  const r = readers.current(ctx);
+  if (!r) throw new HttpError(401, 'Please sign in to keep notes and track your progress.');
+  csrf(ctx);
+  ctx.reader = r;
+}
+const str = (v, max, label) => {
+  const s = typeof v === 'string' ? v.trim() : '';
+  if (s.length > max) throw new HttpError(422, `${label} must be ${max} characters or fewer.`);
+  return s;
+};
+function localDay(ctx, offset = 0) {
+  const off = U.clamp(U.toInt(ctx.req.headers['x-tz-offset'], 0), -840, 840);
+  return new Date(Date.now() - off * 60000 + offset * 86400000).toISOString().slice(0, 10);
+}
+const addDays = (day, n) => new Date(Date.parse(day + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+
+function computeStreaks(days, today) {
+  const set = new Set(days);
+  let current = 0;
+  let cursor = set.has(today) ? today : set.has(addDays(today, -1)) ? addDays(today, -1) : null;
+  while (cursor && set.has(cursor)) { current += 1; cursor = addDays(cursor, -1); }
+  let longest = 0; let runLen = 0; let prev = null;
+  for (const d of [...set].sort()) { runLen = prev && addDays(prev, 1) === d ? runLen + 1 : 1; longest = Math.max(longest, runLen); prev = d; }
+  return { current, longest };
+}
+
+const publishedPost = (id) => get("SELECT id, title, slug FROM posts WHERE id = ? AND status = 'published' AND published_at <= ?", U.toInt(id), U.nowIso());
+function upsertEntry(readerId, post) {
+  const now = U.nowIso();
+  run(`INSERT INTO reader_entries (reader_id, post_id, post_title, post_slug, body, percent, last_read_at, created_at, updated_at)
+       VALUES (?,?,?,?, '', 0, ?, ?, ?)
+       ON CONFLICT(reader_id, post_id) DO UPDATE SET post_title = excluded.post_title, post_slug = excluded.post_slug, last_read_at = excluded.last_read_at`,
+  readerId, post.id, post.title, post.slug, now, now, now);
+  return get('SELECT * FROM reader_entries WHERE reader_id = ? AND post_id = ?', readerId, post.id);
+}
+const markDay = (readerId, day) => run('INSERT OR IGNORE INTO reader_days (reader_id, day) VALUES (?, ?)', readerId, day);
+const entryOut = (e) => e && ({ id: e.id, post_id: e.post_id, title: e.post_title, slug: e.post_slug, body: e.body, percent: e.percent, completed: !!e.completed_at, completed_at: e.completed_at, updated_at: e.updated_at, last_read_at: e.last_read_at });
+
+function mailAsync(to, subject, text, label) {
+  if (!mailer.configured()) return;
+  mailer.send({ to, subject, text }).catch((e) => database.logActivity('system', 'email.failed', `${label}: ${e.message}`));
+}
+
+module.exports = function register(router) {
+  const R = (p) => '/api/reader' + p;
+
+  /* ----- accounts ----- */
+  router.post(R('/register'), async (ctx) => {
+    csrf(ctx);
+    if (!settings.flag('enable_accounts')) throw new HttpError(403, 'New accounts are not being accepted right now.');
+    const b = await readJson(ctx, 10 * 1024);
+    if (b.website) return json(ctx, { ok: true }); // honeypot
+    const gate = joinIp.take(ctx.ip);
+    if (!gate.allowed) throw new HttpError(429, 'Too many sign-up attempts. Please try again later.');
+    const email = str(b.email, 160, 'Email').toLowerCase();
+    if (!EMAIL_RE.test(email)) throw new HttpError(422, 'Enter a valid email address.');
+    const problem = auth.validatePassword(b.password, MIN_PW);
+    if (problem) throw new HttpError(422, problem);
+    const name = str(b.name, 60, 'Name') || email.split('@')[0].slice(0, 60);
+    if (get('SELECT id FROM readers WHERE email = ?', email)) throw new HttpError(409, 'An account with that email already exists. Try signing in, or reset your password.');
+    const r = run('INSERT INTO readers (email, name, password_hash, created_at, last_login) VALUES (?,?,?,?,?)', email, name, await auth.hashPassword(b.password), U.nowIso(), U.nowIso());
+    const session = readers.createSession(r.lastInsertRowid, ctx.ip, ctx.req.headers['user-agent'], b.remember !== false);
+    ctx.res.setHeader('Set-Cookie', readers.cookieHeader(session.token, session.days));
+    json(ctx, { ok: true, reader: { name, email } }, 201);
+  });
+
+  router.post(R('/login'), async (ctx) => {
+    csrf(ctx);
+    const b = await readJson(ctx, 10 * 1024);
+    const email = str(b.email, 160, 'Email').toLowerCase();
+    const g1 = loginIp.take(ctx.ip); const g2 = loginEmail.take(email);
+    if (!g1.allowed || !g2.allowed) {
+      ctx.res.setHeader('Retry-After', Math.max(g1.retryAfter, g2.retryAfter));
+      throw new HttpError(429, 'Too many sign-in attempts. Please wait a few minutes and try again.');
     }
-    var one = function (l) { return l.length === 1; };
-    var base = function (l) { return one(l) ? slugName(l[0].title) : 'breed-a-life-notes-' + stamp(); };
-    pop.appendChild(el('p', { class: 'share-h', text: 'Download' }));
-    item('Text file (.txt)', function (l) { saveFile(base(l) + '.txt', 'text/plain', noteText(l, 'txt')); close(); }, 'Opens anywhere');
-    item('Markdown (.md)', function (l) { saveFile(base(l) + '.md', 'text/markdown', noteText(l, 'md')); close(); }, 'For note apps');
-    item('PDF', function (l) { printPdf(l); close(); }, 'Choose "Save as PDF"');
-    pop.appendChild(el('p', { class: 'share-h', text: 'Share' }));
-    if (navigator.share) item('Share…', function (l) {
-      navigator.share({ title: one(l) ? l[0].title : 'My devotion notes', text: noteText(l, 'txt') }).then(close).catch(function () {});
-    }, 'Use your device share sheet');
-    item('WhatsApp', function (l) { window.open('https://wa.me/?text=' + encodeURIComponent(noteText(l, 'txt')), '_blank', 'noopener'); close(); });
-    item('Email', function (l) { location.href = 'mailto:?subject=' + encodeURIComponent(one(l) ? (l[0].title || 'My devotion notes') : 'My devotion notes') + '&body=' + encodeURIComponent(noteText(l, 'txt').slice(0, 1800)); close(); }, 'Opens your mail app');
-    item('Copy to clipboard', function (l) {
-      var t = noteText(l, 'txt');
-      (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(function () { say('Copied.'); }).catch(function () { say('Copy is not available here. Use Text file instead.'); });
-    });
-    pop.appendChild(note);
-    btn.addEventListener('click', function (e) { e.stopPropagation(); say(''); var show = pop.hidden; pop.hidden = !show; btn.setAttribute('aria-expanded', show ? 'true' : 'false'); });
-    document.addEventListener('click', function (e) { if (!wrap.contains(e.target)) close(); });
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !pop.hidden) { close(); btn.focus(); } });
-    wrap.appendChild(btn); wrap.appendChild(pop);
-    return wrap;
-  }
+    const password = typeof b.password === 'string' ? b.password : '';
+    const reader = email ? get('SELECT * FROM readers WHERE email = ?', email) : null;
+    const ok = reader ? await auth.verifyPassword(password, reader.password_hash) : (await auth.burn(password), false);
+    if (!ok) throw new HttpError(401, 'That email or password is not correct.');
+    loginIp.clear(ctx.ip); loginEmail.clear(email);
+    run('UPDATE readers SET last_login = ? WHERE id = ?', U.nowIso(), reader.id);
+    const session = readers.createSession(reader.id, ctx.ip, ctx.req.headers['user-agent'], b.remember !== false);
+    ctx.res.setHeader('Set-Cookie', readers.cookieHeader(session.token, session.days));
+    json(ctx, { ok: true, reader: { name: reader.name, email: reader.email } });
+  });
 
-  $$('[data-reader-form]').forEach(function (form) {
-    var kind = form.getAttribute('data-reader-form');
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
-      var btn = $('button[type="submit"]', form);
-      var v = function (n) { return form.elements[n] ? form.elements[n].value : ''; };
-      setMsg(form, '');
-      if (!form.checkValidity()) { form.reportValidity(); return; }
-      var req;
-      if (kind === 'join') req = api('POST', '/api/reader/register', { name: v('name'), email: v('email'), password: v('password'), website: v('website') });
-      else if (kind === 'signin') req = api('POST', '/api/reader/login', { email: v('email'), password: v('password'), remember: form.elements.remember ? form.elements.remember.checked : true });
-      else if (kind === 'forgot') req = api('POST', '/api/reader/forgot', { email: v('email') });
-      else if (kind === 'reset') {
-        if (v('password') !== v('confirm')) { setMsg(form, 'The two passwords do not match.', 'error'); return; }
-        req = api('POST', '/api/reader/reset', { token: form.getAttribute('data-token'), password: v('password') });
-      } else if (kind === 'contact') {
-        req = fetch('/contact', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: v('name'), email: v('email'), subject: v('subject'), message: v('message'), website: v('website') }) })
-          .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.message || 'Your message could not be sent.'); return d; }); });
-      } else return;
-      btn.disabled = true;
-      req.then(function (d) {
-        if (kind === 'join' || kind === 'signin') { location.href = safeNext(form.getAttribute('data-next')) || '/journal'; return; }
-        if (kind === 'reset') { setMsg(form, 'Your password has been changed. Taking you to sign in…', 'ok'); setTimeout(function () { location.href = '/signin'; }, 1500); return; }
-        if (kind === 'contact') form.reset();
-        setMsg(form, d.message || 'Done.', 'ok');
-        btn.disabled = false;
-      }).catch(function (err) { setMsg(form, err.message, 'error'); btn.disabled = false; });
+  router.post(R('/logout'), (ctx) => {
+    csrf(ctx);
+    readers.destroy(ctx.cookies[readers.COOKIE]);
+    ctx.res.setHeader('Set-Cookie', readers.clearCookieHeader());
+    json(ctx, { ok: true });
+  });
+
+  router.get(R('/me'), (ctx) => {
+    const r = readers.current(ctx);
+    json(ctx, { reader: r ? { name: r.name, email: r.email } : null });
+  });
+
+  /* ----- forgot / reset password (works with ANY email address the reader signed up with) ----- */
+  router.post(R('/forgot'), async (ctx) => {
+    csrf(ctx);
+    const b = await readJson(ctx, 4 * 1024);
+    const email = str(b.email, 160, 'Email').toLowerCase();
+    const generic = { ok: true, message: 'If an account exists for that email address, a reset link is on its way. It stays valid for 60 minutes.' };
+    if (!EMAIL_RE.test(email)) throw new HttpError(422, 'Enter a valid email address.');
+    const g1 = forgotIp.take(ctx.ip); const g2 = forgotEmail.take(email);
+    if (!g1.allowed || !g2.allowed) throw new HttpError(429, 'Too many reset requests. Please try again in an hour.');
+    const reader = get('SELECT * FROM readers WHERE email = ?', email);
+    if (reader) {
+      const base = resets.safeBase(ctx);
+      if (!mailer.configured()) database.logActivity('system', 'reset.unavailable', 'A reader asked for a password reset but email delivery is not set up (Dashboard > Settings > Email).');
+      else if (!base) database.logActivity('system', 'reset.unavailable', 'Password reset blocked: set your Site URL in Dashboard > Settings so reset links point to your real domain.');
+      else {
+        const token = resets.issue('reader', reader.id, reader.email);
+        const site = settings.get('site_title');
+        mailAsync(reader.email, `Reset your ${site} password`,
+          `Hello ${reader.name},\n\nSomeone asked to reset the password for your ${site} account.\nUse the link below within ${resets.LIFETIME_MIN} minutes to choose a new password:\n\n${base}/reset-password?token=${token}\n\nIf you did not ask for this, you can ignore this email. Your password has not been changed.\n\n${site}`, 'reader reset');
+      }
+    }
+    json(ctx, generic); // identical response whether or not the account exists
+  });
+
+  router.post(R('/reset'), async (ctx) => {
+    csrf(ctx);
+    if (!resetIp.take(ctx.ip).allowed) throw new HttpError(429, 'Too many attempts. Please try again later.');
+    const b = await readJson(ctx, 4 * 1024);
+    const row = resets.find('reader', b.token);
+    if (!row) throw new HttpError(400, 'This reset link is invalid or has expired. Please request a new one.');
+    const problem = auth.validatePassword(b.password, MIN_PW);
+    if (problem) throw new HttpError(422, problem);
+    const reader = get('SELECT id, email FROM readers WHERE id = ?', row.account_id);
+    if (!reader) throw new HttpError(400, 'This reset link is invalid or has expired. Please request a new one.');
+    const hash = await auth.hashPassword(b.password);
+    tx(() => {
+      run('UPDATE readers SET password_hash = ? WHERE id = ?', hash, reader.id);
+      run('DELETE FROM reader_sessions WHERE reader_id = ?', reader.id);
+      resets.markUsed(row.id);
+    });
+    mailAsync(reader.email, `Your ${settings.get('site_title')} password was changed`, `The password for your ${settings.get('site_title')} account was just changed.\n\nIf this was not you, request another reset right away.`, 'reader reset notice');
+    json(ctx, { ok: true });
+  });
+
+  /* ----- devotion entry (note + progress) ----- */
+  router.get(R('/entry/:postId'), guard, (ctx) => {
+    const post = publishedPost(ctx.params.postId);
+    if (!post) throw new HttpError(404, 'That devotion is not available.');
+    json(ctx, { entry: entryOut(get('SELECT * FROM reader_entries WHERE reader_id = ? AND post_id = ?', ctx.reader.id, post.id)) });
+  });
+
+  router.put(R('/entry/:postId/note'), guard, async (ctx) => {
+    if (!noteLimit.take(String(ctx.reader.id)).allowed) throw new HttpError(429, 'You are saving too quickly. Please wait a moment.');
+    const post = publishedPost(ctx.params.postId);
+    if (!post) throw new HttpError(404, 'That devotion is not available.');
+    const b = await readJson(ctx, 64 * 1024);
+    const body = typeof b.body === 'string' ? b.body.replace(/\r\n/g, '\n').slice(0, MAX_NOTE) : '';
+    const entry = upsertEntry(ctx.reader.id, post);
+    run('UPDATE reader_entries SET body = ?, updated_at = ? WHERE id = ?', body, U.nowIso(), entry.id);
+    if (body.trim()) markDay(ctx.reader.id, localDay(ctx));
+    json(ctx, { entry: entryOut(get('SELECT * FROM reader_entries WHERE id = ?', entry.id)) });
+  });
+
+  router.put(R('/entry/:postId/progress'), guard, async (ctx) => {
+    const post = publishedPost(ctx.params.postId);
+    if (!post) throw new HttpError(404, 'That devotion is not available.');
+    const b = await readJson(ctx, 2 * 1024);
+    const pct = U.clamp(U.toInt(b.percent, 0), 0, 100);
+    const entry = upsertEntry(ctx.reader.id, post);
+    if (pct > entry.percent) run('UPDATE reader_entries SET percent = ? WHERE id = ?', pct, entry.id);
+    json(ctx, { entry: entryOut(get('SELECT * FROM reader_entries WHERE id = ?', entry.id)) });
+  });
+
+  router.put(R('/entry/:postId/complete'), guard, async (ctx) => {
+    const post = publishedPost(ctx.params.postId);
+    if (!post) throw new HttpError(404, 'That devotion is not available.');
+    const b = await readJson(ctx, 2 * 1024);
+    const entry = upsertEntry(ctx.reader.id, post);
+    if (b.completed === false) run('UPDATE reader_entries SET completed_at = NULL WHERE id = ?', entry.id);
+    else { run('UPDATE reader_entries SET completed_at = COALESCE(completed_at, ?), percent = 100 WHERE id = ?', U.nowIso(), entry.id); markDay(ctx.reader.id, localDay(ctx)); }
+    json(ctx, { entry: entryOut(get('SELECT * FROM reader_entries WHERE id = ?', entry.id)) });
+  });
+
+  router.delete(R('/entries/:id'), guard, (ctx) => {
+    const e = get('SELECT id FROM reader_entries WHERE id = ? AND reader_id = ?', U.toInt(ctx.params.id), ctx.reader.id);
+    if (!e) throw new HttpError(404, 'Entry not found.');
+    run('DELETE FROM reader_entries WHERE id = ?', e.id);
+    json(ctx, { ok: true });
+  });
+
+  /* ----- journal ----- */
+  router.get(R('/journal'), guard, (ctx) => {
+    const id = ctx.reader.id;
+    const today = localDay(ctx);
+    const days = all('SELECT day FROM reader_days WHERE reader_id = ? ORDER BY day DESC', id).map((r) => r.day);
+    const streak = computeStreaks(days, today);
+    const c = get(`SELECT COUNT(*) AS started, COALESCE(SUM(completed_at IS NOT NULL), 0) AS completed, COALESCE(SUM(body != ''), 0) AS notes FROM reader_entries WHERE reader_id = ?`, id);
+    const available = get("SELECT COUNT(*) AS c FROM posts WHERE status = 'published' AND published_at <= ?", U.nowIso()).c;
+    const entries = all(
+      `SELECT e.id, e.post_id, e.post_title, e.post_slug, e.body, e.percent, e.completed_at, e.last_read_at, e.updated_at, p.slug AS live_slug, m.filename AS cover
+       FROM reader_entries e LEFT JOIN posts p ON p.id = e.post_id LEFT JOIN media m ON m.id = p.cover_id
+       WHERE e.reader_id = ? ORDER BY e.last_read_at DESC LIMIT 300`, id).map((e) => ({
+      id: e.id, title: e.post_title, slug: e.live_slug || null, percent: e.percent, completed: !!e.completed_at, completed_at: e.completed_at,
+      last_read_at: e.last_read_at, updated_at: e.updated_at, has_note: !!e.body, preview: U.truncate(e.body.replace(/\s+/g, ' '), 220), note_length: e.body.length,
+      body: e.body, cover: e.cover && !/\.svg$/i.test(e.cover) ? '/uploads/' + e.cover : e.cover ? '/uploads/' + e.cover : null, removed: !e.live_slug,
+    }));
+    const horizon = addDays(today, -83);
+    json(ctx, {
+      reader: { name: ctx.reader.name, email: ctx.reader.email },
+      stats: { started: c.started, completed: c.completed, notes: c.notes, available, current_streak: streak.current, longest_streak: streak.longest, total_days: days.length },
+      active_days: days.filter((d) => d >= horizon), today, entries,
     });
   });
 
-  /* ---------------- devotion notes (post pages) ---------------- */
-  var drawer = $('#devotion');
-  if (drawer) initDevotion(drawer);
-
-  function initDevotion(drawer) {
-    var postId = drawer.getAttribute('data-post-id');
-    var fab = $('[data-dev-open]'), body = $('[data-dev-body]', drawer), card = $('[data-dev-card]');
-    var lastFocus = null;
-    function open() { lastFocus = document.activeElement; drawer.hidden = false; fab.setAttribute('aria-expanded', 'true'); var t = $('textarea', drawer) || $('a, button', body); if (t) t.focus(); }
-    function close() { drawer.hidden = true; fab.setAttribute('aria-expanded', 'false'); if (lastFocus && lastFocus.focus) lastFocus.focus(); }
-    fab.addEventListener('click', function () { drawer.hidden ? open() : close(); });
-    $('[data-dev-close]', drawer).addEventListener('click', close);
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !drawer.hidden) close(); });
-    document.addEventListener('click', function (e) { var t = e.target.closest && e.target.closest('[data-dev-toggle]'); if (t) { e.preventDefault(); open(); } });
-
-    var here = location.pathname;
-    var nextQ = '?next=' + encodeURIComponent(here);
-
-    function invite(container, compact) {
-      container.textContent = '';
-      container.appendChild(el('h2', { text: 'Keep notes. Track your progress.' }));
-      container.appendChild(el('p', { text: 'Create a free account to write private notes beside each reflection and to see your devotion streak grow. Reading everything else stays open to everyone.' }));
-      container.appendChild(el('div', { class: 'row' }, [
-        el('a', { class: 'btn btn-gold', href: '/join' + nextQ, text: 'Create free account' }),
-        el('a', { class: 'btn', href: '/signin' + nextQ, text: 'Sign in' })
-      ]));
+  router.get(R('/export'), guard, (ctx) => {
+    const rows = all('SELECT * FROM reader_entries WHERE reader_id = ? ORDER BY created_at ASC', ctx.reader.id);
+    const site = settings.get('site_title');
+    let out = `# My ${site} journal\n\nExported ${new Date().toISOString().slice(0, 10)} for ${ctx.reader.name}\n\n`;
+    for (const e of rows) {
+      out += `## ${e.post_title || 'Untitled devotion'}\n\n`;
+      out += `Last read: ${U.formatDate(e.last_read_at)}${e.completed_at ? ` | Completed: ${U.formatDate(e.completed_at)}` : ` | Progress: ${e.percent}%`}\n\n`;
+      out += e.body ? `${e.body}\n\n` : '_No notes written._\n\n';
+      out += '---\n\n';
     }
+    send(ctx, 200, out, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': `attachment; filename="my-journal-${new Date().toISOString().slice(0, 10)}.md"`, 'Cache-Control': 'no-store' });
+  });
 
-    if (!signedIn) {
-      if (card) invite(card, false);
-      body.textContent = '';
-      var wrap = el('div', { class: 'dev-card' }); invite(wrap, true); body.appendChild(wrap);
-      return;
+  /* ----- account settings ----- */
+  router.put(R('/account'), guard, async (ctx) => {
+    const b = await readJson(ctx, 10 * 1024);
+    const reader = get('SELECT * FROM readers WHERE id = ?', ctx.reader.id);
+    const name = b.name !== undefined ? str(b.name, 60, 'Name') : reader.name;
+    if (!name) throw new HttpError(422, 'Please enter a name.');
+    const email = b.email !== undefined ? str(b.email, 160, 'Email').toLowerCase() : reader.email;
+    const emailChanged = email !== reader.email;
+    const passwordChanged = !!b.new_password;
+    if (emailChanged || passwordChanged) {
+      if (!(await auth.verifyPassword(typeof b.current_password === 'string' ? b.current_password : '', reader.password_hash))) throw new HttpError(403, 'Your current password is not correct.');
     }
-
-    /* signed in */
-    var state = { entry: null, dirty: false, timer: null, saving: false, lastPct: 0, lastSent: 0, sentAt: 0 };
-    var ta = el('textarea', { id: 'dev-note', maxlength: '20000', placeholder: 'What is God showing you? Write a prayer, a question, or a verse to remember.', 'aria-describedby': 'dev-status' });
-    var status = el('p', { class: 'dev-status', id: 'dev-status', role: 'status', 'aria-live': 'polite' });
-    var pctText = el('b', { text: '0%' });
-    var barFill = el('i');
-    var bar = el('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': '0', 'aria-label': 'Reading progress' }, [barFill]);
-    var doneBtn = el('button', { class: 'btn', type: 'button' });
-    var cardBtn = null;
-
-    body.textContent = '';
-    body.appendChild(el('div', {}, [el('label', { for: 'dev-note', text: 'Notes for this devotion' }), ta, status]));
-    body.appendChild(el('div', { class: 'dev-progress' }, [el('span', { text: 'Reading progress' }), pctText, bar]));
-    body.appendChild(doneBtn);
-    var h1 = document.querySelector('h1');
-    var postTitle = h1 ? h1.textContent.trim() : document.title;
-    var postSlug = (location.pathname.match(/^\/post\/([^\/?#]+)/) || [])[1] || '';
-    body.appendChild(el('div', { class: 'dev-share' }, [shareMenu(function () { return [{ title: postTitle, slug: postSlug, body: ta.value, date: fmtDate(new Date().toISOString()) }]; }, { label: 'Download or share my notes', btnClass: 'btn btn-gold' })]));
-    body.appendChild(el('div', { class: 'dev-links' }, [el('a', { href: '/journal', text: 'Open my journal' })]));
-
-    function say(text, err) { status.textContent = text || ''; status.className = 'dev-status' + (err ? ' is-error' : ''); }
-    function paint() {
-      var e = state.entry, done = !!(e && e.completed), pct = e ? e.percent : 0;
-      barFill.style.width = pct + '%'; pctText.textContent = pct + '%'; bar.setAttribute('aria-valuenow', String(pct)); bar.classList.toggle('is-done', done);
-      doneBtn.textContent = done ? 'Completed. Tap to undo' : 'Mark devotion complete';
-      doneBtn.className = 'btn ' + (done ? 'btn-done' : 'btn-gold');
-      if (card) {
-        card.textContent = '';
-        card.appendChild(el('h2', { text: done ? 'Devotion complete' : 'Finished reading?' }));
-        card.appendChild(el('p', { text: done ? 'Well done. Your progress has been saved to your journal.' : 'Mark this devotion complete and write down what stood out to you.' }));
-        cardBtn = el('button', { class: 'btn ' + (done ? 'btn-done' : 'btn-gold'), type: 'button', text: done ? 'Completed. Tap to undo' : 'Mark complete', onclick: toggleDone });
-        card.appendChild(el('div', { class: 'row' }, [cardBtn, el('button', { class: 'btn', type: 'button', 'data-dev-toggle': '', text: 'Open my notes' })]));
-      }
+    if (emailChanged) {
+      if (!EMAIL_RE.test(email)) throw new HttpError(422, 'Enter a valid email address.');
+      if (get('SELECT id FROM readers WHERE email = ? AND id != ?', email, reader.id)) throw new HttpError(409, 'That email is already used by another account.');
     }
-    function handle(err) {
-      if (err.status === 401) { say('Your session has ended. Please sign in again to keep saving.', true); signedIn = false; }
-      else say(err.message, true);
+    let hash = reader.password_hash;
+    if (passwordChanged) {
+      const problem = auth.validatePassword(b.new_password, MIN_PW);
+      if (problem) throw new HttpError(422, problem);
+      hash = await auth.hashPassword(b.new_password);
     }
-    function save() {
-      clearTimeout(state.timer);
-      if (!state.dirty || state.saving) return;
-      state.saving = true; state.dirty = false; say('Saving…');
-      api('PUT', '/api/reader/entry/' + postId + '/note', { body: ta.value }).then(function (d) {
-        state.entry = d.entry; state.saving = false;
-        say(state.dirty ? 'Saving…' : 'Saved at ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-        if (state.dirty) save();
-      }).catch(function (err) { state.saving = false; state.dirty = true; handle(err); });
-    }
-    ta.addEventListener('input', function () { state.dirty = true; say('Unsaved changes…'); clearTimeout(state.timer); state.timer = setTimeout(save, 900); });
-    ta.addEventListener('blur', save);
-    window.addEventListener('pagehide', function () {
-      if (state.dirty) { api('PUT', '/api/reader/entry/' + postId + '/note', { body: ta.value }, { keepalive: true }).catch(function () {}); }
-    });
-    function toggleDone() {
-      var want = !(state.entry && state.entry.completed);
-      api('PUT', '/api/reader/entry/' + postId + '/complete', { completed: want }).then(function (d) { state.entry = d.entry; paint(); say(want ? 'Marked complete.' : 'Marked as not complete.'); }).catch(handle);
-    }
-    doneBtn.addEventListener('click', toggleDone);
+    run('UPDATE readers SET name = ?, email = ?, password_hash = ? WHERE id = ?', name, email, hash, reader.id);
+    if (passwordChanged) readers.destroyOthers(reader.id, ctx.reader.tokenHash);
+    if (emailChanged) mailAsync(reader.email, `Your ${settings.get('site_title')} email address was changed`, `The email address on your ${settings.get('site_title')} account was changed to ${email}.\n\nIf this was not you, reset your password immediately.`, 'email change notice');
+    json(ctx, { ok: true, reader: { name, email } });
+  });
 
-    /* reading progress: highest point of the article the reader has scrolled past */
-    var prose = $('.post .prose');
-    function currentPct() {
-      if (!prose) return 0;
-      var r = prose.getBoundingClientRect();
-      if (r.height <= 0) return 0;
-      return Math.max(0, Math.min(100, Math.round(((window.innerHeight - r.top) / r.height) * 100)));
-    }
-    var ticking = false;
-    function track() {
-      ticking = false;
-      var p = currentPct();
-      if (p > state.lastPct) state.lastPct = p;
-      var e = state.entry;
-      if (!signedIn || (e && e.completed)) return;
-      var enough = state.lastPct >= state.lastSent + 5 || (state.lastPct === 100 && state.lastSent < 100);
-      if (enough && Date.now() - state.sentAt > 2500) {
-        state.sentAt = Date.now(); state.lastSent = state.lastPct;
-        api('PUT', '/api/reader/entry/' + postId + '/progress', { percent: state.lastPct }).then(function (d) { state.entry = d.entry; paint(); }).catch(function () {});
-      }
-    }
-    window.addEventListener('scroll', function () { if (!ticking) { ticking = true; requestAnimationFrame(track); } }, { passive: true });
-
-    api('GET', '/api/reader/entry/' + postId).then(function (d) {
-      state.entry = d.entry;
-      if (d.entry) { ta.value = d.entry.body || ''; state.lastPct = state.lastSent = d.entry.percent; }
-      paint(); track();
-    }).catch(function (err) { paint(); handle(err); });
-  }
-
-  /* ---------------- journal page ---------------- */
-  var jroot = $('[data-journal]');
-  if (jroot) initJournal(jroot);
-
-  function initJournal(root) {
-    api('GET', '/api/reader/journal').then(function (d) { render(root, d); }).catch(function (err) {
-      root.textContent = '';
-      if (err.status === 401) { location.href = '/signin?next=/journal'; return; }
-      root.appendChild(el('p', { class: 'empty', text: err.message }));
-    });
-  }
-
-  function render(root, d) {
-    var s = d.stats;
-    var greeting = $('[data-j-greeting]');
-    if (greeting) greeting.textContent = 'Welcome, ' + d.reader.name + '. Your notes and progress are private to you.';
-    root.textContent = '';
-
-    var stats = el('div', { class: 'j-stats' });
-    [[s.completed, 'Completed' + (s.available ? ' of ' + s.available : '')], [Math.max(0, s.started - s.completed), 'In progress'], [s.notes, 'Notes written'], [s.current_streak, 'Day streak'], [s.longest_streak, 'Longest streak']].forEach(function (x) {
-      stats.appendChild(el('div', { class: 'j-stat' }, [el('b', { text: String(x[0]) }), el('span', { text: x[1] })]));
-    });
-    root.appendChild(stats);
-
-    var active = {}; d.active_days.forEach(function (x) { active[x] = true; });
-    var heat = el('div', { class: 'heat', role: 'img', 'aria-label': 'Days you wrote a note or completed a devotion in the last 12 weeks: ' + d.active_days.length });
-    for (var i = 83; i >= 0; i--) {
-      var t = new Date(d.today + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() - i);
-      var key = t.toISOString().slice(0, 10);
-      heat.appendChild(el('i', { class: (active[key] ? 'on' : '') + (i === 0 ? ' today' : ''), title: key + (active[key] ? ': active' : '') }));
-    }
-    root.appendChild(el('section', { class: 'j-panel' }, [el('h2', { text: 'The last 12 weeks' }), heat, el('p', { class: 'heat-legend', text: 'A gold square marks a day you wrote a note or completed a devotion. ' + s.total_days + ' active ' + (s.total_days === 1 ? 'day' : 'days') + ' in total.' })]));
-
-    /* entries */
-    var filter = 'all', query = '';
-    var list = el('div', { class: 'j-list' });
-    var tools = el('div', { class: 'j-tools' });
-    var chips = el('div', { class: 'chips' });
-    [['all', 'All'], ['done', 'Completed'], ['progress', 'In progress'], ['notes', 'With notes']].forEach(function (f) {
-      var b = el('button', { type: 'button', 'aria-pressed': f[0] === 'all' ? 'true' : 'false', text: f[1], onclick: function () { filter = f[0]; $$('button', chips).forEach(function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); }); draw(); } });
-      chips.appendChild(b);
-    });
-    var search = el('input', { type: 'search', placeholder: 'Search your notes', 'aria-label': 'Search your notes' });
-    search.addEventListener('input', function () { query = search.value.trim().toLowerCase(); draw(); });
-    tools.appendChild(chips); tools.appendChild(search);
-
-    function draw() {
-      list.textContent = '';
-      var rows = d.entries.filter(function (e) {
-        if (filter === 'done' && !e.completed) return false;
-        if (filter === 'progress' && e.completed) return false;
-        if (filter === 'notes' && !e.has_note) return false;
-        if (query && (e.title + ' ' + e.body).toLowerCase().indexOf(query) < 0) return false;
-        return true;
-      });
-      if (!rows.length) {
-        list.appendChild(el('div', { class: 'empty' }, [
-          el('h3', { text: d.entries.length ? 'Nothing matches' : 'Your journal is empty' }),
-          el('p', {}, d.entries.length ? ['Try a different filter or search.'] : ['Open any reflection and choose “Devotion notes” to begin. ', el('a', { href: '/blog', text: 'Browse reflections' }), '.'])
-        ]));
-        return;
-      }
-      rows.forEach(function (e) { list.appendChild(entry(e)); });
-    }
-
-    function entry(e) {
-      var title = e.slug ? el('a', { href: '/post/' + e.slug, text: e.title || 'Untitled devotion' }) : document.createTextNode(e.title || 'Untitled devotion');
-      var node = el('article', { class: 'j-entry' + (e.completed ? ' is-done' : '') });
-      node.appendChild(el('h3', {}, [title]));
-      var meta = el('div', { class: 'j-meta' }, [
-        el('span', { class: 'chip ' + (e.completed ? 'chip-done' : ''), text: e.completed ? 'Completed' : e.percent + '% read' }),
-        e.removed ? el('span', { class: 'chip chip-gone', text: 'Post no longer available' }) : null,
-        el('span', { text: 'Last read ' + fmtDate(e.last_read_at) })
-      ]);
-      node.appendChild(meta);
-      if (e.has_note) {
-        var note = el('div', { class: 'j-note', text: e.body });
-        node.appendChild(note);
-      }
-      var actions = el('div', { class: 'j-actions' });
-      if (e.has_note) actions.appendChild(shareMenu(function () { return [{ title: e.title, slug: e.slug, body: e.body, date: fmtDate(e.last_read_at) }]; }, { btnClass: 'link-btn', label: 'Download or share' }));
-      if (e.slug) actions.appendChild(el('a', { href: '/post/' + e.slug, text: e.has_note ? 'Open devotion and edit notes' : 'Open devotion' }));
-      var del = el('button', { class: 'link-btn danger', type: 'button', text: 'Delete entry' });
-      del.addEventListener('click', function () {
-        if (del.getAttribute('data-sure') !== '1') { del.textContent = 'Click again to delete notes and progress'; del.setAttribute('data-sure', '1'); setTimeout(function () { del.textContent = 'Delete entry'; del.removeAttribute('data-sure'); }, 4000); return; }
-        api('DELETE', '/api/reader/entries/' + e.id).then(function () { d.entries = d.entries.filter(function (x) { return x.id !== e.id; }); draw(); }).catch(function (err) { del.textContent = err.message; });
-      });
-      actions.appendChild(del);
-      node.appendChild(actions);
-      return node;
-    }
-
-    var allBar = el('div', { class: 'j-allbar' }, [shareMenu(function () { return d.entries.filter(function (e) { return e.has_note; }).map(function (e) { return { title: e.title, slug: e.slug, body: e.body, date: fmtDate(e.last_read_at) }; }); }, { label: 'Download or share all notes' })]);
-    root.appendChild(el('h2', { text: 'Your devotions', style: 'margin-bottom:1rem' }));
-    root.appendChild(allBar); root.appendChild(tools); root.appendChild(list); draw();
-
-    /* account */
-    var acct = el('section', { class: 'j-panel j-account', style: 'margin-top:2.5rem' }, [el('h2', { text: 'Your account' })]);
-    acct.appendChild(el('p', { class: 'muted', text: 'Signed in as ' + d.reader.email }));
-
-    function formBlock(summary, fields, submitText, handler, danger) {
-      var f = el('form', { novalidate: true });
-      fields.forEach(function (x) {
-        f.appendChild(el('div', { class: 'field', style: 'margin-bottom:.8rem' }, [el('label', { for: 'acc-' + x.n, text: x.l }), el('input', { id: 'acc-' + x.n, name: x.n, type: x.t || 'text', value: x.v || '', autocomplete: x.a || 'off', maxlength: '200' })]));
-      });
-      var msg = el('p', { class: 'form-msg', role: 'alert', 'aria-live': 'polite' });
-      f.appendChild(el('button', { class: 'btn ' + (danger ? '' : 'btn-gold'), type: 'submit', text: submitText }));
-      f.appendChild(msg);
-      f.addEventListener('submit', function (ev) {
-        ev.preventDefault(); msg.textContent = ''; msg.className = 'form-msg';
-        var vals = {}; fields.forEach(function (x) { vals[x.n] = f.elements[x.n].value; });
-        handler(vals).then(function (text) { msg.textContent = text || 'Saved.'; msg.className = 'form-msg is-ok'; }).catch(function (err) { msg.textContent = err.message; msg.className = 'form-msg is-error'; });
-      });
-      acct.appendChild(el('details', {}, [el('summary', { text: summary }), f]));
-    }
-    formBlock('Change your name', [{ n: 'name', l: 'Name', v: d.reader.name, a: 'given-name' }], 'Save name', function (v) { return api('PUT', '/api/reader/account', { name: v.name }).then(function () { return 'Name saved.'; }); });
-    formBlock('Change your email address', [{ n: 'email', l: 'New email address', t: 'email', v: d.reader.email, a: 'email' }, { n: 'current_password', l: 'Current password', t: 'password', a: 'current-password' }], 'Save email', function (v) { return api('PUT', '/api/reader/account', { email: v.email, current_password: v.current_password }).then(function () { return 'Email updated. Password resets will now go to this address.'; }); });
-    formBlock('Change your password', [{ n: 'current_password', l: 'Current password', t: 'password', a: 'current-password' }, { n: 'new_password', l: 'New password (8+ characters)', t: 'password', a: 'new-password' }], 'Save password', function (v) { return api('PUT', '/api/reader/account', { current_password: v.current_password, new_password: v.new_password }).then(function () { return 'Password changed. Other devices were signed out.'; }); });
-    acct.appendChild(el('details', {}, [el('summary', { text: 'Export or sign out' }), el('p', { style: 'margin-top:1rem' }, [el('a', { class: 'btn', href: '/api/reader/export', download: '', text: 'Download my notes (.md)' }), ' ', el('button', { class: 'btn', type: 'button', text: 'Sign out', onclick: function () { api('POST', '/api/reader/logout').then(function () { location.href = '/'; }); } })])]));
-    formBlock('Delete my account', [{ n: 'password', l: 'Confirm with your password', t: 'password', a: 'current-password' }], 'Permanently delete my account and notes', function (v) { return api('DELETE', '/api/reader/account', { password: v.password }).then(function () { location.href = '/'; return 'Deleted.'; }); }, true);
-    root.appendChild(acct);
-  }
-})();
+  router.delete(R('/account'), guard, async (ctx) => {
+    const b = await readJson(ctx, 4 * 1024);
+    const reader = get('SELECT * FROM readers WHERE id = ?', ctx.reader.id);
+    if (!(await auth.verifyPassword(typeof b.password === 'string' ? b.password : '', reader.password_hash))) throw new HttpError(403, 'That password is not correct.');
+    run('DELETE FROM readers WHERE id = ?', reader.id); // cascades to sessions, notes, progress
+    ctx.res.setHeader('Set-Cookie', readers.clearCookieHeader());
+    json(ctx, { ok: true });
+  });
+};
